@@ -1,77 +1,121 @@
-import telebot
-import yt_dlp
 import os
-from flask import Flask
-from threading import Thread
+import sqlite3
+import logging
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ContextTypes
+import yt_dlp
+from keep_alive import keep_alive
 
-# --- إعدادات البوت ---
-TOKEN = "8577286605:AAHVkonH1grTFnHZeOaTmGnFw21XWhRNAYs" # ضع التوكن الخاص بك هنا
-bot = telebot.TeleBot(TOKEN)
+# --- الإعدادات (استبدل البيانات هنا) ---
+TOKEN = '8521737523:AAGv-XRGN9x-IqhDZZqTfS10U5rQveVZYlI'
+ADMIN_ID = 5524416062  # ضع الآيدي الخاص بك هنا (للدخول للوحة التحكم)
 
-# --- سيرفر ويب خفيف لإبقاء البوت حياً ---
-app = Flask('')
-@app.route('/')
-def home():
-    return "OK"
+# تشغيل سيرفر الويب للبقاء حياً 24 ساعة
+keep_alive()
 
-def run():
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
+# --- إعداد قاعدة البيانات ---
+def setup_db():
+    conn = sqlite3.connect('data.db')
+    c = conn.cursor()
+    c.execute('CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY)')
+    c.execute('CREATE TABLE IF NOT EXISTS groups (id TEXT PRIMARY KEY)')
+    conn.commit()
+    conn.close()
 
-# --- 1. الرسالة الترحيبية ---
-@bot.message_handler(commands=['start'])
-def welcome(message):
-    user_name = message.from_user.first_name
-    welcome_text = (
-        f"👋 أهلاً بك يا {user_name} في بوت تحميل الفيديوهات!\n\n"
-        "📥 أنا هنا لمساعدتك في تحميل فيديوهات يوتيوب بسهولة.\n"
-        "✨ فقط أرسل لي رابط الفيديو (أو Shorts) وسأقوم بمعالجته لك فوراً.\n\n"
-        "⚠️ ملاحظة: أقصى حجم مدعوم للإرسال هو 50 ميجابايت."
-    )
-    bot.reply_to(message, welcome_text)
+def add_data(table, chat_id):
+    conn = sqlite3.connect('data.db')
+    c = conn.cursor()
+    c.execute(f'INSERT OR IGNORE INTO {table} VALUES (?)', (str(chat_id),))
+    conn.commit()
+    conn.close()
 
-# --- 2. معالجة روابط يوتيوب والتحميل الذكي ---
-@bot.message_handler(func=lambda m: "youtube.com" in m.text or "youtu.be" in m.text)
-def download_logic(message):
-    msg = bot.reply_to(message, "⏳ جاري فحص حجم الفيديو والتحميل... يرجى الانتظار.")
+# --- وظيفة التحميل الشاملة ---
+def download_media(url, mode):
+    ydl_opts = {
+        # 'best' للفيديو و 'bestaudio' للصوت
+        'format': 'bestvideo+bestaudio/best' if mode == 'video' else 'bestaudio/best',
+        'cookiefile': 'cookies.txt', # ضروري جداً ليوتيوب
+        'outtmpl': 'downloads/%(title)s.%(ext)s',
+        'nocheckcertificate': True,
+        'quiet': True,
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+    }
     
-    try:
-        # إعدادات yt-dlp لاختيار جودة لا تتعدى 50 ميجا
-        # تقوم هذه الصيغة باختيار أفضل جودة متاحة بشرط ألا يتجاوز الحجم 48MB
-        ydl_opts = {
-            'format': 'best[filesize<48M]/bestvideo[ext=mp4][filesize<40M]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-            'outtmpl': 'downloads/%(id)s.%(ext)s',
-            'noplaylist': True,
-        }
-
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(message.text, download=True)
-            file_path = ydl.prepare_filename(info)
-
-        # إرسال الفيديو للمستخدم
-        with open(file_path, 'rb') as video:
-            bot.send_video(message.chat.id, video, caption="✅ تم التحميل بنجاح بواسطة بوتك!")
-        
-        # حذف الملف بعد الإرسال لتوفير مساحة في Render
-        if os.path.exists(file_path):
-            os.remove(file_path)
-        bot.delete_message(message.chat.id, msg.message_id)
-
-    except Exception as e:
-        error_msg = "❌ عذراً، لا يمكن تحميل هذا الفيديو:\n"
-        if "filesize" in str(e).lower():
-            error_msg += "الحجم لا يزال كبيراً جداً حتى بعد محاولة الضغط."
-        else:
-            error_msg += "الفيديو قد يكون محمياً أو هناك مشكلة في الرابط."
-        
-        bot.edit_message_text(error_msg, message.chat.id, msg.message_id)
-        print(f"Error detail: {e}")
-
-# --- تشغيل البوت والسيرفر ---
-if __name__ == "__main__":
     if not os.path.exists('downloads'):
         os.makedirs('downloads')
-    # تشغيل البوت في خيط منفصل
-    Thread(target=lambda: bot.infinity_polling(skip_pending=True)).start()
-    # تشغيل السيرفر الرئيسي لـ Render
-    run()
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        return ydl.prepare_filename(info)
+
+# --- معالجة الأوامر ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    
+    # ترحيب وحفظ البيانات
+    if update.effective_chat.type == 'private':
+        add_data('users', user_id)
+        msg = f"أهلاً بك {update.effective_user.first_name}!\n\nأرسل لي أي رابط من (يوتيوب، فيسبوك، تيك توك، انستا، سناب) وسأقوم بتحميله فوراً."
+    else:
+        add_data('groups', chat_id)
+        msg = "البوت مفعل الآن في المجموعة!"
+
+    # أزرار المسؤول
+    markup = None
+    if user_id == ADMIN_ID:
+        keyboard = [[InlineKeyboardButton("📊 إحصائيات المستخدمين", callback_data='stats')]]
+        markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text(msg, reply_markup=markup)
+
+async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    url = update.message.text
+    if "http" in url:
+        context.user_data['url'] = url
+        keyboard = [[
+            InlineKeyboardButton("فيديو 🎬", callback_data='v'),
+            InlineKeyboardButton("صوت 🎵", callback_data='a')
+        ]]
+        await update.message.reply_text("اختر طريقة التحميل:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    # لوحة الإحصائيات
+    if query.data == 'stats':
+        conn = sqlite3.connect('data.db')
+        c = conn.cursor()
+        users = c.execute('SELECT COUNT(*) FROM users').fetchone()[0]
+        groups = c.execute('SELECT COUNT(*) FROM groups').fetchone()[0]
+        conn.close()
+        await query.message.reply_text(f"📊 إحصائياتك:\n👤 المستخدمين: {users}\n👥 المجموعات: {groups}")
+        return
+
+    # التحميل
+    url = context.user_data.get('url')
+    mode = 'video' if query.data == 'v' else 'audio'
+    wait_msg = await query.message.reply_text("🚀 جاري التحميل... انتظر قليلاً")
+
+    try:
+        path = download_media(url, mode)
+        with open(path, 'rb') as f:
+            if mode == 'video':
+                await query.message.reply_video(video=f, caption="تم التحميل بواسطة بوتك ✅")
+                else:
+                await query.message.reply_audio(audio=f, caption="تم التحميل بواسطة بوتك ✅")
+        os.remove(path)
+        await wait_msg.delete()
+    except Exception as e:
+        await wait_msg.edit_text(f"❌ حدث خطأ، تأكد من ملف cookies.txt أو الرابط.\nالسبب: {str(e)[:50]}")
+
+# --- التشغيل ---
+if __name__ == '__main__':
+    setup_db()
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
+    app.add_handler(CallbackQueryHandler(actions))
+    print("البوت يعمل...")
+    app.run_polling()
